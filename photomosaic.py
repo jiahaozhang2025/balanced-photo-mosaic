@@ -1,16 +1,28 @@
 #!/usr/bin/env python3
 """
-Mosaic (Random assignment + per-placement color match)
+Photomosaic with balanced tile usage.
 
-For each tile cell:
-  1) Pick a random source image (balanced across the set).
-  2) Recolor that tile so its statistics match the target patch.
+For each cell of the mosaic:
+  1) Choose a source image — by default the next one from a shuffled sequence
+     that uses every tile about equally, rather than whichever happens to be
+     closest in colour.
+  2) Recolour it so its statistics match the target patch.
   3) Paste.
+
+Both steps are switchable, which is what makes the comparison in the README
+reproducible from this one script:
+
+  --select balanced   every tile used about equally (default)
+  --select nearest    the conventional photomosaic: closest tile by mean colour
+  --no-recolor        paste tiles untouched
 
 Usage:
   python photomosaic.py target.jpg ./tiles \
     --tile-size 50 --enlargement 8 --mode meanstd --seed 123 \
     --out mosaic.jpeg
+
+`fetch_example.py` will download a public-domain target and a tile set to try
+it on.
 
 Requires: Pillow, numpy
   pip install pillow numpy
@@ -126,7 +138,7 @@ def load_tiles(tiles_dir: str, tile_size: int) -> List[Image.Image]:
         raise RuntimeError("No valid tiles found.")
     return tiles
 
-# ------------- balanced random assignment -------------
+# ------------- tile selection -------------
 def make_balanced_assignments(num_tiles: int, total_cells: int, rng: random.Random) -> List[int]:
     """
     Repeat [0..num_tiles-1] enough times to cover total_cells, shuffle once,
@@ -137,24 +149,44 @@ def make_balanced_assignments(num_tiles: int, total_cells: int, rng: random.Rand
     rng.shuffle(base)
     return base[:total_cells]
 
+
+def tile_mean_colors(tiles: List[Image.Image]) -> np.ndarray:
+    """Average RGB of every tile, for the conventional nearest-colour search."""
+    return np.stack([np.asarray(t, dtype=np.float32).reshape(-1, 3).mean(axis=0) for t in tiles])
+
+
+def nearest_tile(tile_means: np.ndarray, patch: np.ndarray) -> int:
+    """The conventional choice: whichever tile's average colour is closest.
+
+    This is what makes a classic photomosaic repetitive. A large flat region of
+    sky asks the same question of the same tile set several thousand times and
+    gets the same answer every time.
+    """
+    return int(np.argmin(((tile_means - patch.mean(axis=0)) ** 2).sum(axis=1)))
+
 # ------------- mosaic builder -------------
 def build_mosaic_random(target_big: Image.Image,
                         tiles: List[Image.Image],
                         mode: str,
                         seed: int,
                         out_path: str,
-                        tile_size: int):
+                        tile_size: int,
+                        select: str = "balanced",
+                        recolor: bool = True):
     W, H = target_big.size
     x_count = W // tile_size
     y_count = H // tile_size
     total_cells = x_count * y_count
-    print(f"Grid: {x_count} x {y_count} = {total_cells} tiles")
+    print(f"Grid: {x_count} x {y_count} = {total_cells} tiles "
+          f"({select} selection, {'recoloured' if recolor else 'untouched'})")
 
     rng = random.Random(seed)
     assignments = make_balanced_assignments(len(tiles), total_cells, rng)
+    tile_means = tile_mean_colors(tiles) if select == "nearest" else None
 
     # pre-extract pixel data for tiles to avoid repeated .getdata() calls
     tiles_pixels = [list(t.getdata()) for t in tiles]
+    usage = np.zeros(len(tiles), dtype=np.int64)
 
     mosaic = Image.new("RGB", (W, H))
 
@@ -170,16 +202,20 @@ def build_mosaic_random(target_big: Image.Image,
             # target patch pixels
             target_patch = list(target_big.crop(box).getdata())
 
-            # pick tile index by assignment
-            tile_idx = assignments[idx]
+            # pick the tile: balanced sequence, or the conventional nearest colour
+            if tile_means is None:
+                tile_idx = assignments[idx]
+            else:
+                tile_idx = nearest_tile(tile_means, _to_np_rgb(target_patch))
+            usage[tile_idx] += 1
             tile_px = tiles_pixels[tile_idx]
 
-            # recolor to match this patch
-            matched_px = color_match_pixels(tile_px, target_patch, mode=mode)
+            if recolor:
+                tile_px = color_match_pixels(tile_px, target_patch, mode=mode)
 
             # paste
             tile_img = Image.new("RGB", (tile_size, tile_size))
-            tile_img.putdata(matched_px)
+            tile_img.putdata(tile_px)
             mosaic.paste(tile_img, box)
 
             done += 1
@@ -188,7 +224,11 @@ def build_mosaic_random(target_big: Image.Image,
                 print(f"Progress: {pct:5.1f}%", end="\r")
 
     mosaic.save(out_path, quality=95)
-    print(f"\nFinished. Wrote {out_path}")
+    used = int((usage > 0).sum())
+    print(f"\nTile usage: {used}/{len(tiles)} tiles used, "
+          f"most-used appears {int(usage.max()):,} times "
+          f"({usage.max() / total_cells:.1%} of the mosaic)")
+    print(f"Finished. Wrote {out_path}")
 
 # ------------- CLI -------------
 def parse_args():
@@ -199,6 +239,12 @@ def parse_args():
     p.add_argument("--enlargement", type=int, default=8, help="Scale factor for the output mosaic vs. input")
     p.add_argument("--mode", choices=["mean", "meanstd", "luma"], default="meanstd",
                    help="Color match mode (mean=biased tint; meanstd=match mean+std; luma=match brightness/contrast only)")
+    p.add_argument("--select", choices=["balanced", "nearest"], default="balanced",
+                   help="balanced uses every tile about equally; nearest is the conventional "
+                        "photomosaic, picking the closest tile by mean colour")
+    p.add_argument("--no-recolor", action="store_true",
+                   help="Paste tiles untouched. With --select nearest that is the classic "
+                        "photomosaic; with balanced it is noise.")
     p.add_argument("--seed", type=int, default=12345, help="Random seed for balanced assignment")
     p.add_argument("--out", default="mosaic.jpeg", help="Output filename")
     return p.parse_args()
@@ -218,6 +264,8 @@ def main():
         seed=args.seed,
         out_path=args.out,
         tile_size=args.tile_size,
+        select=args.select,
+        recolor=not args.no_recolor,
     )
 
 if __name__ == "__main__":

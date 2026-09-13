@@ -1,0 +1,10 @@
+# Fetched data and built mosaics — everything here is reproducible
+examples/
+# Only at the repo root: images/mosaic.jpg is a committed figure.
+/mosaic.jpg
+/mosaic.jpeg
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
